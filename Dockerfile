@@ -21,7 +21,6 @@ WORKDIR /app
 
 # Copy Cargo manifests first to leverage Docker caching
 COPY Cargo.toml Cargo.lock ./
-COPY dolos/Cargo.toml ./dolos/
 
 # Fetch dependencies (so we can rebuild only app source later)
 RUN cargo fetch
