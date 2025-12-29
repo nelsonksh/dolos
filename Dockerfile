@@ -19,14 +19,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set working directory
 WORKDIR /app
 
-# Copy Cargo manifests first to leverage Docker caching
-COPY Cargo.toml Cargo.lock ./
-
+COPY . .
 # Fetch dependencies (so we can rebuild only app source later)
 RUN cargo fetch
-
-# Copy the full source code
-COPY . .
 
 # Set environment variables for GMP/MPFR (optional but sometimes needed)
 ENV GMP_LIB_DIR=/usr/lib
