@@ -1,47 +1,58 @@
-# 1. Builder
-FROM debian:bookworm-slim AS builder
+# ----------------------------
+# 1. Builder stage
+# ----------------------------
+FROM rust:1.81-slim-bullseye AS builder
 
-# Install build deps
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      build-essential \
-      git \
-      pkg-config \
-      libssl-dev \
-      libgmp-dev \
-      libmpfr-dev \
-      ca-certificates \
-      curl \
-      && rm -rf /var/lib/apt/lists/*
+# Install system dependencies for building GMP/MPFR and Rust crates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    libgmp-dev \
+    libmpfr-dev \
+    m4 \
+    ca-certificates \
+    curl \
+    git \
+    bash \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install Rust toolchain
-RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
-ENV PATH="/root/.cargo/bin:${PATH}"
-
+# Set working directory
 WORKDIR /app
 
-# Copy source
+# Copy Cargo manifests first to leverage Docker caching
+COPY Cargo.toml Cargo.lock ./
+COPY dolos/Cargo.toml ./dolos/
+
+# Fetch dependencies (so we can rebuild only app source later)
+RUN cargo fetch
+
+# Copy the full source code
 COPY . .
 
-# Use a Cargo config to prefer the workspace `pallas` and lockfile
-RUN cargo clean
+# Set environment variables for GMP/MPFR (optional but sometimes needed)
+ENV GMP_LIB_DIR=/usr/lib
+ENV GMP_INCLUDE_DIR=/usr/include
+ENV MPFR_LIB_DIR=/usr/lib
+ENV MPFR_INCLUDE_DIR=/usr/include
+
+# Build release
 RUN cargo build --release
 
-# 2. Runtime image
-FROM debian:bookworm-slim
+# ----------------------------
+# 2. Runtime stage
+# ----------------------------
+FROM debian:bullseye-slim
 
-# Needed for TLS etc.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      ca-certificates \
-      libssl3 \
-      libgmp10 \
-      libmpfr6 \
-      && rm -rf /var/lib/apt/lists/*
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgmp10 \
+    libmpfr6 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /root/
+# Copy the compiled binary from the builder
+WORKDIR /app
+COPY --from=builder /app/target/release/dolos .
 
-# Copy the built binary
-COPY --from=builder /app/target/release/dolos /usr/local/bin/dolos
-
-ENTRYPOINT ["dolos"]
+# Default command
+CMD ["./dolos"]
