@@ -1,46 +1,55 @@
-# Use Rust nightly on Debian Bookworm
-FROM rust:nightly-bookworm AS builder
+# 1. Builder stage
+FROM debian:bookworm AS builder
 
-# Install system dependencies
+# Set noninteractive for apt
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build essentials and dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
+    curl \
+    git \
+    pkg-config \
     libgmp-dev \
     libmpfr-dev \
     m4 \
-    pkg-config \
-    curl \
+    cmake \
+    bash \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Rust (nightly)
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain nightly
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Set workdir
 WORKDIR /app
 
-# Copy Cargo manifests first (cache dependencies)
+# Copy Cargo files to cache dependencies first
 COPY Cargo.toml Cargo.lock ./
 
-# Fetch dependencies
+# Fetch dependencies (cached if Cargo.toml didn't change)
 RUN cargo fetch
 
-# Copy source code
+# Copy full source code
 COPY . .
 
 # Build release
 RUN cargo build --release
 
-# ----------------------------
 # 2. Runtime stage
-# ----------------------------
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim AS runtime
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install minimal runtime dependencies
+RUN apt-get update && apt-get install -y \
     libgmp10 \
     libmpfr6 \
     ca-certificates \
+    bash \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the compiled binary from the builder
-WORKDIR /app
-COPY --from=builder /app/target/release/dolos .
+# Copy binary from builder
+COPY --from=builder /app/target/release/dolos /usr/local/bin/dolos
 
-# Default command
-CMD ["./dolos"]
+# Set entrypoint
+ENTRYPOINT ["/usr/local/bin/dolos"]
