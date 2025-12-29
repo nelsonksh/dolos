@@ -1,33 +1,27 @@
-# ----------------------------
-# 1. Builder stage
-# ----------------------------
-FROM rust:1.81-slim-bullseye AS builder
+# Use Rust nightly on Debian Bookworm
+FROM rust:nightly-bookworm AS builder
 
-# Install system dependencies for building GMP/MPFR and Rust crates
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
     build-essential \
-    pkg-config \
     libgmp-dev \
     libmpfr-dev \
     m4 \
-    ca-certificates \
+    pkg-config \
     curl \
-    git \
-    bash \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
-COPY . .
-# Fetch dependencies (so we can rebuild only app source later)
+# Copy Cargo manifests first (cache dependencies)
+COPY Cargo.toml Cargo.lock ./
+
+# Fetch dependencies
 RUN cargo fetch
 
-# Set environment variables for GMP/MPFR (optional but sometimes needed)
-ENV GMP_LIB_DIR=/usr/lib
-ENV GMP_INCLUDE_DIR=/usr/include
-ENV MPFR_LIB_DIR=/usr/lib
-ENV MPFR_INCLUDE_DIR=/usr/include
+# Copy source code
+COPY . .
 
 # Build release
 RUN cargo build --release
