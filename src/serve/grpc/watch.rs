@@ -194,17 +194,18 @@ fn block_to_txs<C: LedgerContext + Domain>(
     let txs = block.txs();
 
     txs.iter()
-        .map(|x: &pallas::ledger::traverse::MultiEraTx<'_>| {
-            let mut tx = mapper.map_tx(x);
-            fill_input_as_output(&mut tx, mapper, domain);
-            tx
-        })
+        .map(|x: &pallas::ledger::traverse::MultiEraTx<'_>| mapper.map_tx(x))
         .filter(|tx| {
             request
                 .predicate
                 .as_ref()
                 .is_none_or(|predicate| apply_predicate(predicate, tx))
         })
+        .map(|mut tx| {
+            fill_input_as_output(&mut tx, mapper, domain);
+            tx
+        })
+
         .map(|x| u5c::watch::AnyChainTx {
             chain: Some(u5c::watch::any_chain_tx::Chain::Cardano(x)),
             block: Some(u5c::watch::AnyChainBlock {
