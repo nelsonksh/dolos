@@ -4,7 +4,7 @@ use pallas::interop::utxorpc::spec as u5c;
 use pallas::interop::utxorpc::{self as interop, LedgerContext};
 use pallas::{
     interop::utxorpc::spec::watch::any_chain_tx_pattern::Chain,
-    ledger::{addresses::Address, traverse::MultiEraBlock},
+    ledger::{addresses::Address, traverse::MultiEraBlock, traverse::MultiEraOutput},
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -146,17 +146,43 @@ fn apply_predicate(predicate: &u5c::watch::TxPredicate, tx: &u5c::cardano::Tx) -
     tx_matches && !not_clause && and_clause && or_clause
 }
 
-fn block_to_txs<C: LedgerContext>(
+fn fill_input_as_output(
+    tx: &mut u5c::cardano::Tx,
+    mapper: &interop::Mapper<impl LedgerContext>,
+    domain: &impl Domain,
+) {
+    for input in tx.inputs.iter_mut() {
+        let txo_ref = TxoRef(
+            input.tx_hash.as_ref().try_into().unwrap(),
+            input.output_index as u32,
+        );
+
+        if let Ok(utxos) = domain.state().get_utxos(vec![txo_ref]) {
+            if let Some((_, body)) = utxos.iter().next() {
+                if let Ok(parsed) = MultiEraOutput::try_from(body) {
+                    input.as_output = Some(mapper.map_tx_output(&parsed, None));
+                }
+            }
+        }
+    }
+}
+
+fn block_to_txs<C: LedgerContext + Domain>(
     block: &RawBlock,
     mapper: &interop::Mapper<C>,
     request: &u5c::watch::WatchTxRequest,
+    domain: &C,
 ) -> Vec<u5c::watch::AnyChainTx> {
     let RawBlock { body, .. } = block;
     let block = MultiEraBlock::decode(body).unwrap();
     let txs = block.txs();
 
     txs.iter()
-        .map(|x: &pallas::ledger::traverse::MultiEraTx<'_>| mapper.map_tx(x))
+        .map(|x: &pallas::ledger::traverse::MultiEraTx<'_>| {
+            let mut tx = mapper.map_tx(x);
+            fill_input_as_output(&mut tx, mapper, domain);
+            tx
+        })
         .filter(|tx| {
             request
                 .predicate
@@ -175,18 +201,19 @@ fn block_to_txs<C: LedgerContext>(
         .collect()
 }
 
-fn roll_to_watch_response<C: LedgerContext>(
+fn roll_to_watch_response<C: LedgerContext + Domain>(
     mapper: &interop::Mapper<C>,
     log: &LogValue,
     request: &u5c::watch::WatchTxRequest,
+    domain: &C,
 ) -> impl Stream<Item = u5c::watch::WatchTxResponse> {
     let txs: Vec<_> = match log {
-        LogValue::Apply(block) => block_to_txs(block, mapper, request)
+        LogValue::Apply(block) => block_to_txs(block, mapper, request, domain)
             .into_iter()
             .map(u5c::watch::watch_tx_response::Action::Apply)
             .map(|x| u5c::watch::WatchTxResponse { action: Some(x) })
             .collect(),
-        LogValue::Undo(block) => block_to_txs(block, mapper, request)
+        LogValue::Undo(block) => block_to_txs(block, mapper, request, domain)
             .into_iter()
             .map(u5c::watch::watch_tx_response::Action::Undo)
             .map(|x| u5c::watch::WatchTxResponse { action: Some(x) })
@@ -254,9 +281,10 @@ where
         );
 
         let mapper = self.mapper.clone();
+        let domain = self.domain.clone();
 
         let stream = stream
-            .flat_map(move |log| roll_to_watch_response(&mapper, &log, &inner_req))
+            .flat_map(move |log| roll_to_watch_response(&mapper, &log, &inner_req, &domain))
             .map(Ok);
 
         Ok(Response::new(Box::pin(stream)))
