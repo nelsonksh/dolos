@@ -4,7 +4,10 @@ use pallas::interop::utxorpc::spec as u5c;
 use pallas::interop::utxorpc::{self as interop, LedgerContext};
 use pallas::{
     interop::utxorpc::spec::watch::any_chain_tx_pattern::Chain,
-    ledger::{addresses::Address, traverse::MultiEraBlock, traverse::MultiEraOutput},
+    ledger::{
+        addresses::Address,
+        traverse::{MultiEraBlock, MultiEraTx},
+    },
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -146,23 +149,36 @@ fn apply_predicate(predicate: &u5c::watch::TxPredicate, tx: &u5c::cardano::Tx) -
     tx_matches && !not_clause && and_clause && or_clause
 }
 
-fn fill_input_as_output(
+fn fill_input_as_output<D: Domain + LedgerContext>(
     tx: &mut u5c::cardano::Tx,
-    mapper: &interop::Mapper<impl LedgerContext>,
-    domain: &impl Domain,
+    mapper: &interop::Mapper<D>,
+    domain: &D,
 ) {
     for input in tx.inputs.iter_mut() {
-        let txo_ref = TxoRef(
-            input.tx_hash.as_ref().try_into().unwrap(),
-            input.output_index as u32,
-        );
+        let hash: [u8; 32] = match input.tx_hash.as_ref().try_into() {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
 
-        if let Ok(utxos) = domain.state().get_utxos(vec![txo_ref]) {
-            if let Some((_, body)) = utxos.iter().next() {
-                if let Ok(parsed) = MultiEraOutput::try_from(body) {
-                    input.as_output = Some(mapper.map_tx_output(&parsed, None));
+        let tx_index = match domain.archive().get_block_with_tx(&hash) {
+            Ok(Some((_, index))) => index,
+            _ => continue,
+        };
+
+        if let Ok(Some(body)) = domain.archive().get_tx(&hash) {
+            if let Ok(tx_impl) = MultiEraTx::try_from(&body) {
+                if let Some(output) = tx_impl.outputs().get(input.output_index as usize) {
+                    input.as_output = Some(mapper.map_tx_output(output, None));
                 }
             }
+        } else if let Ok(Some((body, _))) = domain.archive().get_block_with_tx(&hash) {
+             if let Ok(block) = MultiEraBlock::decode(&body) {
+                 if let Some(tx_impl) = block.txs().get(tx_index) {
+                     if let Some(output) = tx_impl.outputs().get(input.output_index as usize) {
+                        input.as_output = Some(mapper.map_tx_output(output, None));
+                     }
+                 }
+             }
         }
     }
 }
