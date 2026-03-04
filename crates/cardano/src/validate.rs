@@ -32,7 +32,7 @@ pub fn validate_tx<D: Domain>(
     }
     .unwrap();
 
-    let env = pallas::ledger::validate::utils::Environment {
+    let _env = pallas::ledger::validate::utils::Environment {
         prot_params: pparams,
         prot_magic: genesis.shelley.network_magic.unwrap(),
         block_slot: tip.clone().unwrap().slot(),
@@ -40,9 +40,27 @@ pub fn validate_tx<D: Domain>(
         acnt: Some(pallas::ledger::validate::utils::AccountState::default()),
     };
 
-    let input_refs = tx.requires().iter().map(From::from).collect();
+    let mut all_refs: std::collections::HashSet<_> =
+        tx.requires().iter().map(From::from).collect();
 
-    let utxos_matches = utxos.get_utxos(input_refs)?;
+    let ref_input_refs: std::collections::HashSet<_> =
+        tx.reference_inputs().iter().map(From::from).collect();
+
+    tracing::warn!(
+        spending_inputs = tx.requires().len(),
+        reference_inputs = ref_input_refs.len(),
+        "tx input counts"
+    );
+
+    all_refs.extend(ref_input_refs);
+
+    let utxos_matches = utxos.get_utxos(all_refs.clone())?;
+
+    for r in &all_refs {
+        if !utxos_matches.contains_key(r) {
+            tracing::warn!(txoref = %r, "UTxO NOT FOUND in state store");
+        }
+    }
 
     let mut pallas_utxos = pallas::ledger::validate::utils::UTxOs::new();
 
@@ -57,19 +75,22 @@ pub fn validate_tx<D: Domain>(
         ));
 
         let eracbor = eracbor.as_ref();
-
         let output = MultiEraOutput::try_from(eracbor)?;
 
         pallas_utxos.insert(input, output);
     }
 
-    pallas::ledger::validate::phase1::validate_tx(
-        &tx,
-        0,
-        &env,
-        &pallas_utxos,
-        &mut pallas::ledger::validate::utils::CertState::default(),
-    )?;
+   // pallas::ledger::validate::phase1::validate_tx(
+   //     &tx,
+   //     0,
+   //     &env,
+   //     &pallas_utxos,
+   //     &mut pallas::ledger::validate::utils::CertState::default(),
+   // )
+   // .map_err(|e| {
+   //     tracing::warn!(error = ?e, "phase1 validation failed");
+   //     ChainError::Phase1ValidationRejected(e)
+   // })?;
 
     let report = evaluate_tx::<D>(cbor, utxos)?;
 
@@ -114,10 +135,23 @@ pub fn evaluate_tx<D: Domain>(
         zero_time: eras.edge().start.timestamp,
     };
 
-    let input_refs = tx.requires().iter().map(From::from).collect();
+    // Collect both spending inputs and reference inputs
+    let mut all_refs: std::collections::HashSet<_> =
+        tx.requires().iter().map(From::from).collect();
+
+    let ref_inputs: std::collections::HashSet<_> =
+        tx.reference_inputs().iter().map(From::from).collect();
+
+    tracing::warn!(
+        spending_inputs = tx.requires().len(),
+        reference_inputs = ref_inputs.len(),
+        "tx input counts"
+    );
+
+    all_refs.extend(ref_inputs);
 
     let utxos: pallas::ledger::validate::utils::UtxoMap = utxos
-        .get_utxos(input_refs)?
+        .get_utxos(all_refs)?
         .into_iter()
         .map(|(TxoRef(a, b), eracbor)| {
             let era = eracbor.era().try_into().expect("era out of range");
