@@ -4,7 +4,10 @@ use pallas::interop::utxorpc::spec as u5c;
 use pallas::interop::utxorpc::{self as interop, LedgerContext};
 use pallas::{
     interop::utxorpc::spec::watch::any_chain_tx_pattern::Chain,
-    ledger::{addresses::Address, traverse::MultiEraBlock},
+    ledger::{
+        addresses::Address,
+        traverse::{MultiEraBlock, MultiEraTx},
+    },
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -146,10 +149,68 @@ fn apply_predicate(predicate: &u5c::watch::TxPredicate, tx: &u5c::cardano::Tx) -
     tx_matches && !not_clause && and_clause && or_clause
 }
 
-fn block_to_txs<C: LedgerContext>(
+fn fill_input_as_output<D: Domain + LedgerContext>(
+    input: &mut u5c::cardano::TxInput,
+    mapper: &interop::Mapper<D>,
+    domain: &D,
+) {
+    if input.as_output.is_some() {
+        return;
+    }
+
+    let hash: [u8; 32] = match input.tx_hash.as_ref().try_into() {
+        Ok(x) => x,
+        Err(_) => return,
+    };
+
+    if let Ok(Some(body)) = domain.archive().get_tx(&hash) {
+        if let Ok(tx_impl) = MultiEraTx::try_from(&body) {
+            if let Some(output) = tx_impl.outputs().get(input.output_index as usize) {
+                input.as_output = Some(mapper.map_tx_output(output, None));
+                return;
+            }
+        }
+    }
+
+    if let Ok(Some((body, tx_index))) = domain.archive().get_block_with_tx(&hash) {
+        if let Ok(block) = MultiEraBlock::decode(&body) {
+            if let Some(tx_impl) = block.txs().get(tx_index) {
+                if let Some(output) = tx_impl.outputs().get(input.output_index as usize) {
+                    input.as_output = Some(mapper.map_tx_output(output, None));
+                }
+            }
+        }
+    }
+}
+
+fn fill_inputs_as_output<D: Domain + LedgerContext>(
+    inputs: &mut [u5c::cardano::TxInput],
+    mapper: &interop::Mapper<D>,
+    domain: &D,
+) {
+    for input in inputs.iter_mut() {
+        fill_input_as_output(input, mapper, domain);
+    }
+}
+
+fn fill_tx_as_output<D: Domain + LedgerContext>(
+    tx: &mut u5c::cardano::Tx,
+    mapper: &interop::Mapper<D>,
+    domain: &D,
+) {
+    fill_inputs_as_output(tx.inputs.as_mut_slice(), mapper, domain);
+    fill_inputs_as_output(tx.reference_inputs.as_mut_slice(), mapper, domain);
+
+    if let Some(collateral) = tx.collateral.as_mut() {
+        fill_inputs_as_output(collateral.collateral.as_mut_slice(), mapper, domain);
+    }
+}
+
+fn block_to_txs<C: LedgerContext + Domain>(
     block: &RawBlock,
     mapper: &interop::Mapper<C>,
     request: &u5c::watch::WatchTxRequest,
+    domain: &C,
 ) -> Vec<u5c::watch::AnyChainTx> {
     let RawBlock { body, .. } = block;
     let block = MultiEraBlock::decode(body).unwrap();
@@ -163,26 +224,35 @@ fn block_to_txs<C: LedgerContext>(
                 .as_ref()
                 .is_none_or(|predicate| apply_predicate(predicate, tx))
         })
+        .map(|mut tx| {
+            fill_tx_as_output(&mut tx, mapper, domain);
+            tx
+        })
         .map(|x| u5c::watch::AnyChainTx {
             chain: Some(u5c::watch::any_chain_tx::Chain::Cardano(x)),
-            // TODO(p): should it be none?
-            block: None,
+            block: Some(u5c::watch::AnyChainBlock {
+                native_bytes: body.to_vec().into(),
+                chain: Some(u5c::watch::any_chain_block::Chain::Cardano(
+                    mapper.map_block_cbor(body),
+                )),
+            }),
         })
         .collect()
 }
 
-fn roll_to_watch_response<C: LedgerContext>(
+fn roll_to_watch_response<C: LedgerContext + Domain>(
     mapper: &interop::Mapper<C>,
     log: &LogValue,
     request: &u5c::watch::WatchTxRequest,
+    domain: &C,
 ) -> impl Stream<Item = u5c::watch::WatchTxResponse> {
     let txs: Vec<_> = match log {
-        LogValue::Apply(block) => block_to_txs(block, mapper, request)
+        LogValue::Apply(block) => block_to_txs(block, mapper, request, domain)
             .into_iter()
             .map(u5c::watch::watch_tx_response::Action::Apply)
             .map(|x| u5c::watch::WatchTxResponse { action: Some(x) })
             .collect(),
-        LogValue::Undo(block) => block_to_txs(block, mapper, request)
+        LogValue::Undo(block) => block_to_txs(block, mapper, request, domain)
             .into_iter()
             .map(u5c::watch::watch_tx_response::Action::Undo)
             .map(|x| u5c::watch::WatchTxResponse { action: Some(x) })
@@ -250,9 +320,10 @@ where
         );
 
         let mapper = self.mapper.clone();
+        let domain = self.domain.clone();
 
         let stream = stream
-            .flat_map(move |log| roll_to_watch_response(&mapper, &log, &inner_req))
+            .flat_map(move |log| roll_to_watch_response(&mapper, &log, &inner_req, &domain))
             .map(Ok);
 
         Ok(Response::new(Box::pin(stream)))
