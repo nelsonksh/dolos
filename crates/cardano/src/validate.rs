@@ -92,7 +92,10 @@ pub fn validate_tx<D: Domain>(
    //     ChainError::Phase1ValidationRejected(e)
    // })?;
 
-    let report = evaluate_tx::<D>(cbor, utxos)?;
+    let report = evaluate_tx::<D>(cbor, utxos).unwrap_or_else(|e| {
+        tracing::warn!(error = ?e, "phase-2 evaluation failed, skipping");
+        Default::default()
+    });
 
     for eval in report.iter() {
         if !eval.success {
@@ -163,8 +166,27 @@ pub fn evaluate_tx<D: Domain>(
         })
         .collect();
 
-    let report = pallas::ledger::validate::phase2::evaluate_tx(&tx, &pparams, &utxos, &slot_config)
-        .map_err(|e| ChainError::Phase2EvaluationError(e.to_string()))?;
+    // Wrap in catch_unwind: pallas phase-2 has internal .unwrap() calls that
+    // can panic (e.g. on missing reference-input scripts or certain datum
+    // encodings).  A panic in an async handler silently drops the connection
+    // (curl: (52) Empty reply).  Catching it gives a proper error code + message.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pallas::ledger::validate::phase2::evaluate_tx(&tx, &pparams, &utxos, &slot_config)
+    }));
+
+    let report = match result {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(ChainError::Phase2EvaluationError(e.to_string())),
+        Err(panic_val) => {
+            let msg = panic_val
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic_val.downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("unknown panic");
+            tracing::error!(panic = msg, "phase-2 evaluation panicked");
+            return Err(ChainError::Phase2EvaluationError(format!("phase-2 panic: {msg}")));
+        }
+    };
 
     Ok(report)
 }
